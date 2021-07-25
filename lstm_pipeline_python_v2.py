@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import pandas as pd
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data import TensorDataset, DataLoader
-from pipeline import *
+from pipeline_v2 import *
 from gensim.models import Word2Vec, KeyedVectors
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
@@ -25,7 +25,7 @@ import argparse
 import chardet
 import gensim.downloader as api
 from gensim.models.wrappers import FastText
-from transformers import DistilBertTokenizer, DistilBertForTokenClassification, DistilBertModel
+from transformers import DistilBertTokenizer, DistilBertForTokenClassification, DistilBertModel, BertTokenizer, BertModel
 
 def check_insertions(tokens_modified, encodings_y):
 	for i in range(len(encodings_y)):
@@ -36,6 +36,18 @@ def check_insertions(tokens_modified, encodings_y):
 
 
 def modify_encoding(encoding, tokens_db, tokens_modified):
+	"""
+	For transformers usage, modifies an encoding and tokenized turn
+	given the transformer tokenization, includes [CLS] and [SEP] insertions, 
+	and split token insertions
+
+	encoding: the encoding to be modified
+	tokens_db: db = distilbert, but any tokenized sentence can be provided
+	tokens_modified: the tokenized turn to be modified
+
+	returns: None
+	"""
+
 	##### CLS AND SEP TOKENS ######
 	cls_index = 0
 	sep_index = len(encoding) + 1
@@ -69,33 +81,66 @@ def modify_encoding(encoding, tokens_db, tokens_modified):
 	# split_tokens.append(count)
 	# return split_tokens
 
-def get_max_length(raw_args, encodings_y):
+def get_max_length(tokens_x, encodings_y):
+	"""
+	Gets the max length of the tokenized turns and encodings provided
+
+	tokens_x: the tokenized turns
+	encodings_y: the encoded turns
+	
+	returns: the max length
+	"""
+
 	max_len = 0
-	for i in range(len(raw_args)):
-#         print(len(arguments[i]))
-		if len(raw_args[i]) > max_len:
-			max_len = len(raw_args[i])
+	for i in range(len(tokens_x)):
+		if len(tokens_x[i]) > max_len:
+			max_len = len(tokens_x[i])
 		if len(encodings_y[i]) > max_len:
 			max_len = len(encodings_y[i])
 	
 	return max_len			
 
-##### PADDING LSTM INPUT (TO HAVE SEQUENCES THE SAME LENGTH) #####
-# Based on using the max length in the full dataset
-def pad(raw_args, encodings_y, max_len):
+def pad(tokens_x, encodings_y, max_len):
+	"""
+	Pads the tokenized turn and encoding to the max length
+
+	tokens_x: the tokenized turns
+	encodings_y: the encoded turns
+	max_len: the max length
+	
+	returns: None
+	"""
+
 	for i in range(len(encodings_y)):
-		missing_len_arg = max_len - len(raw_args[i])
-		missing_len_encode = max_len - len(encodings_y[i])
+		if len(encodings_y[i]) <= max_len:
+			missing_len_arg = max_len - len(tokens_x[i])
+			missing_len_encode = max_len - len(encodings_y[i])
 
-		# Zero padding at the end
-		encodings_y[i].extend([1] * (missing_len_encode))
-		raw_args[i].extend(["[PAD]"] * (missing_len_arg))
+			# Zero padding at the end
+			encodings_y[i].extend([1] * (missing_len_encode))
+			tokens_x[i].extend(["[PAD]"] * (missing_len_arg))
+		else:
+			# remove beginning and end if exceeds max length ([CLS] and [SEP] from transformer tokenization):
+			for j in range(len(encodings_y[i]) - max_len):
+				del encodings_y[i][len(encodings_y[i]) - 1]
+				del tokens_x[i][len(encodings_y[i]) - 1]
 
-##### CREATE WORD EMBEDDINGS (HUGGINGFACE TRANSFORMERS) #####
 def create_embeddings_x_hf(raw_args, max_len, tokens_modified, encodings_y):
-	print("testing with all arguments")
-	tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-cased')
-	model = DistilBertModel.from_pretrained('distilbert-base-cased', output_hidden_states = True)
+	"""
+	Creates embeddings using the distilbert transformer
+	
+	raw args: a list of raw, untokenized sentences
+	max_len: the max length
+	encodings_y: the encoded turns
+	tokens_modified: the list of tokenized turns modified using this func.
+	
+	returns: a torch tensor containing the embeddings
+	"""
+
+
+	# print("testing with all arguments")
+	tokenizer = BertTokenizer.from_pretrained('distilbert-base-cased')
+	model = BertModel.from_pretrained('distilbert-base-cased', output_hidden_states = True)
 
 	input_ids = []
 	split_tokens_list = []
@@ -137,75 +182,105 @@ def create_embeddings_x_hf(raw_args, max_len, tokens_modified, encodings_y):
 	with torch.no_grad():
 		outputs = model(input_ids)
 
-	print(len(outputs["hidden_states"]))
-	print(outputs["hidden_states"][0].size())
+	# print(len(outputs["hidden_states"]))
+	# print(outputs["hidden_states"][0].size())
 
 	num_layers = 7
 	last_four = 4
 	embedding_size = 768
+
+	# x = outputs["hidden_states"][num_layers - 2]
+
 	x = torch.zeros(len(raw_args), max_len, embedding_size)
 	for i in range(num_layers - last_four, num_layers, 1):
 		x = x.add(outputs["hidden_states"][i])
+		# print(outputs["hidden_states"][i][0][0][:5])
+		# print(x[0][0][:5])
+		# print("\n")
 
-	print(x.size())
+	# print(x.size())
 	# print(outputs["hidden_states"][0][0])
-	# print(outputs["hidden_states"][0][1])
+	# print(outputs["hidden_states"][1][0])
 	# # print(outputs["hidden_states"][i][0][0][2])
-	# print(outputs["hidden_states"][0][0].add(outputs["hidden_states"][0][1]))
+	# print(outputs["hidden_states"][0][0].add(outputs["hidden_states"][1][0]))
 
-	return 0
+	return x
 
-##### CREATE WORD EMBEDDINGS (GENSIM) #####
-def create_embeddings_x_gensim(raw_args, max_len, model_path, model_type, embedding_size=300):
+def create_embeddings_x_gensim(tokens_x, max_len, model_path, model_type, embedding_size=300):
+	"""
+	Creates embeddings using a gensim embedding model
 
-	# Pre-trained word2vec
-	# print("Loading Word2Vec")
-
+	tokens_x: the tokenized turns
+	max_len: the max length
+	model_path: the path to a gensim embedding model
+	model_type: the type of model (fasttext, word2vec, glove)	
+	embedding_size: the embedding size (default = 300)
+	
+	returns: a torch tensor containing the embeddings
+	"""
 
 	if model_type == 'w2v': 
 		model = KeyedVectors.load_word2vec_format(model_path, binary=True, unicode_errors='replace')
 	if model_type == 'other':
 		model = api.load(model_path)
 
-	x = torch.zeros(len(raw_args), max_len, embedding_size)
-	# SEMANTIC ENCODING
-	for i in range(len(raw_args)):
+	x = torch.zeros(len(tokens_x), max_len, embedding_size)
+
+	for i in range(len(tokens_x)):
 		embeddings = torch.zeros(max_len, embedding_size)
 		word_embedding_sum = np.zeros((1, embedding_size))
 		for j in range(max_len):
 			try:
-				word_embedding = model.wv[raw_args[i][j]]
+				word_embedding = model.wv[tokens_x[i][j]]
 				word_embedding_sum += word_embedding 
 				embeddings[j] = torch.FloatTensor(word_embedding)
 			except KeyError as e:
-				if raw_args[i][j] == "[PAD]":
+				if tokens_x[i][j] == "[PAD]":
 					embeddings[j] = torch.zeros((1, embedding_size))
 				else:
 					embeddings[j] = torch.ones((1, embedding_size))
+
+		# Using an averaged word embedding as replacement for unseen words
 		num_unseen_words = 0
 		for k in range(len(embeddings)):
-#             print(embeddings[i])
 			if torch.all(torch.eq(embeddings[k], torch.ones((1, 300)))):
-				# Using an averaged word embedding as replacement for unseen words
 				embeddings[k] = torch.from_numpy(word_embedding_sum/max_len)
 				num_unseen_words+=1
-#         print(embeddings.size())
-#         print(embeddings)
+
 		x[i] = embeddings
 
 	return x
 
-##### CREATE Y EMBEDDINGS/ENCODINGS #####
-def create_embeddings_y(raw_args, encodings_y, max_len):
-	y = torch.zeros(len(raw_args), max_len)
-	# print(len(encodings_y))
+def create_embeddings_y(tokens_x, encodings_y, max_len):
+	"""
+	Creates encoding embeddings by converting tags to tensors
+
+	tokens_x: the tokenized turns
+	encodings_y: the encoded turns
+	max_len: the max length
+	
+	returns: a torch tensor containing the encodings
+	"""
+
+	y = torch.zeros(len(tokens_x), max_len)
 	for i in range(len(encodings_y)):
-#         print(i)
 		y[i] = torch.FloatTensor(encodings_y[i])
 	
 	return y
 
 def remove_pad(encodings_x, encodings_y, original_encodings, indices=""):
+	"""
+	Removes the padding from predictions for obtaining metrices, each 
+	encoding is truncated to match the original encodings
+
+	encodings_x: the predicted encodings
+	encodings_y: the encoded turns (with padding)
+	original_encodings: the original encodings (without padding)
+	indices: the indices of data values (used in evaluation stage)
+	
+	returns: None
+	"""
+
 	increment = 0
 	current_index = 0
 
@@ -213,7 +288,6 @@ def remove_pad(encodings_x, encodings_y, original_encodings, indices=""):
 		encodings_y[i] = encodings_y[i].numpy()
 		encodings_x[i] = encodings_x[i].numpy()
 
-		# print(encodings_y[i])
 
 		if indices == "":
 			current_index = i
@@ -223,22 +297,35 @@ def remove_pad(encodings_x, encodings_y, original_encodings, indices=""):
 			current_index = increment
 			original_encodings[current_index] = np.array(original_encodings[current_index])
 
-			# print(original_encodings[indices[index]])
-		# print("\n")
 		if encodings_y[i].shape[0] != original_encodings[current_index].shape[0]:
 			encodings_y[i] = encodings_y[i][:-(encodings_y[i].shape[0] - original_encodings[current_index].shape[0])]
 
 			# Do the same with x encoding if it doesn't match y
 			if encodings_x[i].shape[0] != encodings_y[i].shape[0]:
 				encodings_x[i] = encodings_x[i][:-(encodings_x[i].shape[0] - encodings_y[i].shape[0])]
-				# print(encodings_x[i])
+
 		encodings_x[i] = encodings_x[i].tolist()
 		encodings_y[i] = encodings_y[i].tolist()
 
 		increment += 1
 
-##### PYTORCH DATASET FOR TRAINING PURPOSES #####
 class TranscriptDataset(Dataset):
+	"""
+	The dataset class used for training and testing pytorch models
+
+	file_dir: a directory of files containing transcripts
+	file_name: a single transcript file
+	cv_dict: a dictionary of cross validation sets
+	cv_value: the k value of cross validation
+	cv_type: train or test for cross validation
+	opened_file: the file where O-insertion edge cases are written to
+	model_path: the file path of the gensim word embedding model
+	model_type: the gensim embedding model type
+	write_to_file: the flag to write to the edge case file or not
+	embedding_type: huggingface (hf) or gensim
+	
+	returns: None
+	"""
 	def __init__(self, file_dir="", file_name="", cv_dict="", cv_value="", cv_type="", opened_file="", model_path="", model_type="", only_multi=False, write_to_file=False, embedding_type="gensim"):
 		# If file path given in for cross validation json
 		if cv_dict != "":
@@ -264,13 +351,13 @@ class TranscriptDataset(Dataset):
 		raw_args_list = []
 		ne_list = []
 
-		files = [files[0]]
+		# files = [files[0]]
 		# Concatenation of transcripts
 		for x in range(len(files)):
 			out = convert_transcript(files[x])
 			encodings_y, remove_list, _, segments = encode_y(to_TurnSegmentation(convert_transcript(files[x])))
 			arg_list, tokens_x, _ = make_arg_list(to_TurnSegmentation(convert_transcript(files[x])))
-			insert_Os(tokens_x, segments, encodings_y, files[x], opened_file, out, write_to_file=write_to_file)
+			# insert_Os(tokens_x, segments, encodings_y, files[x], opened_file, out, write_to_file=write_to_file)
 			encodings_y_list += encodings_y
 			tokens_x_list += tokens_x
 			segments_list += segments
@@ -281,6 +368,7 @@ class TranscriptDataset(Dataset):
 
 		# print("All lengths match: " + str(check_lengths(tokens_x_list, segments_list, encodings_y_list)))
 		max_len = get_max_length(tokens_x_list, encodings_y_list)
+		# print("Max Length: " + str(max_len))
 
 		if embedding_type == "gensim":
 			pad(tokens_x_list, encodings_y_list, max_len)
@@ -302,17 +390,19 @@ class TranscriptDataset(Dataset):
 
 		return indexed_x, indexed_y
 
-# Other structure params
-num_classes = 3
 
-# Hyperparameters
-input_size = 768
-hidden_size = 100
-bi_hidden_size = hidden_size*2
-num_layers = 1
-
-##### BI-LSTM STRUCTURE AND FORWARD PASS #####
 class BiLSTM(nn.Module):
+	"""
+	The Bi-LSTM class used for token classification
+
+	input_size: the size of the embedding
+	hidden_size: the number of units in the hidden layer
+	num_classes: the number of tokens to be classified (IOB)
+	num_layers: the number of layers in the model
+	
+	returns: None
+	"""
+
 	def __init__(self, input_size, hidden_size, num_classes, num_layers):
 		super(BiLSTM, self).__init__()
 		self.bi_lstm = nn.LSTM(input_size=input_size,
@@ -324,16 +414,34 @@ class BiLSTM(nn.Module):
 		
 	def forward(self, x):
 		out, final = self.bi_lstm(x)
-#         print(out.size())
 		fc_out = self.fc(out)
-#         print(fc_out.size())
 		out = fc_out.view(-1, num_classes)
 		return out
 
-# def train_on_corpus(model, data):
+class BaseNN(nn.Module):
+
+	def __init__(self, input_size, ):
+		super(BaseNN, self).__init__()
+		self.linear_and_relu = nn.Sequential(nn.Linear(input_size, 512),
+											 nn.ReLU(),
+											 nn.Linear(512, num_classes),
+											 nn.ReLU())
+
+	def forward(self, x):
+		out = self.linear_and_relu(x)
+		out = out.view(-1, num_classes)
+		return out
 
 
 def apply_word2vec_model(w2v_txt_file):
+	"""
+	Creates a gensim word2vec model given a file containing sentences
+
+	w2v_txt_file: the file name of the corpus
+
+	returns: the gensim model
+	"""
+
 	count = 0
 	train_documents = []
 	embedding_size = 300
@@ -355,20 +463,6 @@ def apply_word2vec_model(w2v_txt_file):
 				break
 
 			line = fp.readline()
-		# count += 1
-		# #arbitrarily chose representation for how many unk words
-		# while line :
-		# 	try:
-		# 		line = fp.readline()
-		# 		if count < 100:
-		# 			#tokenize the text store into a list
-		# 			train_documents.append(word_tokenize(re.sub(r"[,.;@#?!&$]+\ *", " ", line.lower() + " unk")))
-		# 		else:
-		# 			train_documents.append(word_tokenize(re.sub(r"[,.;@#?!&$]+\ *", " ", line.lower())))
-		# 		count += 1
-		# 	except UnicodeDecodeError:
-		# 		pass
-		# 		count += 1
 
 	#train word2vec model
 	model = Word2Vec(train_documents, size=embedding_size)
@@ -380,13 +474,25 @@ def apply_word2vec_model(w2v_txt_file):
 	return w2v_model
 
 
-##### TRAIN CROSS VALIDATION #####
-def train(params, train_loader, val_loader, val_indices, original_encodings, experiment_name, weights_file_name, save_weights_file=True, stats_path=""):
+def train(params, model, train_loader, val_loader, val_indices, original_encodings, experiment_name, weights_file_name, save_weights_file=True, stats_path=""):
+	"""
+	Trains a token classification model with a validation set
+
+	params: the hyperparameters of the model determined from cross validation
+	model: the pytorch model used
+	train_loader: the pytorch dataloader (train set)
+	val_loader: the pytorch dataloader (validation set)
+	val_indices: indices of the validation set (for padding removal purposes, since random_split randomizes selection)
+	original_encodings: the original encodings without padding
+	experiment_name: the name of the experiment
+	weights_file_name: the name of the weights file saved
+	save_weights_file: flag used to determine whether file is saved
+	stats_path: the file path/name of saved metrics
+
+	returns: None
+	"""
+
 	device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-	model = BiLSTM(input_size=input_size,
-				   hidden_size=bi_hidden_size,
-				   num_classes=num_classes,
-				   num_layers=params["num_layers"])
 	model = model.to(device)
 
 	criterion = nn.CrossEntropyLoss()
@@ -497,7 +603,19 @@ def train(params, train_loader, val_loader, val_indices, original_encodings, exp
 
 
 ##### TRAIN ON FULL DATASET #####
-def train_full(params, train_loader, experiment_name, weights_file_name):
+def train_full(params, model, train_loader, experiment_name, weights_file_name):
+	"""
+	Same as train() but without validation phase
+
+	params: the hyperparameters of the model determined from cross validation
+	model: the pytorch model used
+	train_loader: the pytorch dataloader (train set)
+	experiment_name: the name of the experiment
+	weights_file_name: the name of the weights file saved
+
+	returns: None
+	"""
+
 	device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 	model = BiLSTM(input_size=input_size,
 				   hidden_size=bi_hidden_size,
@@ -555,8 +673,19 @@ def train_full(params, train_loader, experiment_name, weights_file_name):
 	best_model_weights = copy.deepcopy(model.state_dict())
 	torch.save({'model' : best_model_weights}, os.path.join(experiment_name, weights_file_name))
 
-def test(params, test_loader, experiment_name, weights_file_name):
-	##### ANALYZE PREDICTIONS #####
+def test(params, model, test_loader, experiment_name, weights_file_name):
+	"""
+	Tests a token classification model, obtains predicted encodings
+
+	params: the hyperparameters of the model determined from cross validation
+	model: the pytorch model used
+	test_loader: the pytorch dataloader (test set)
+	experiment_name: the name of the experiment
+	weights_file_name: the name of the weights file saved
+
+	returns: None
+	"""
+
 	device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 	result_list = []
 	word_list = []
@@ -564,12 +693,9 @@ def test(params, test_loader, experiment_name, weights_file_name):
 	num_correct = 0
 	true_size = 0
 	state_dict = torch.load(os.path.join(experiment_name, weights_file_name))
-	model = BiLSTM(input_size=input_size,
-				   hidden_size=bi_hidden_size,
-				   num_classes=num_classes,
-				   num_layers=params["num_layers"])
 	model.load_state_dict(state_dict['model'])
 	model.eval()
+
 	for (_, data) in enumerate(test_loader):
 		embeddings = data[0]
 		iob_labels = data[1]
@@ -585,15 +711,17 @@ def test(params, test_loader, experiment_name, weights_file_name):
 
 def main():
 	parser = argparse.ArgumentParser(description="")
-	parser.add_argument("-a", "--msg", type=str, help="description of task", required=True)
-	parser.add_argument("-p", "--path", type=str, help="file path for train or test", required=True)
+
+	parser.add_argument("-a", "--msg", type=str, help="description of task, for logging purposes")
+	
+	# required arguments
+	parser.add_argument("-p", "--path", type=str, help="data file path for train or test", required=True)
 	parser.add_argument("-t", '--train_or_test', type=str, help="training or testing (\"train\", \"test\")", required=True)
-	# parser.add_argument("-t", '--cv_or_train_or_test', type=str, help="cv or training or testing (\"cv\", \"train\", \"test\")")
 	parser.add_argument("-x", "--experiment_folder_name", type=str, help="name of experiment", required=True)
 
+	# optional files to save
 	parser.add_argument("-m", '--save_stats_file', action="store_true", help="computes standard metrics and conf matrices and saves file")
 	parser.add_argument("-d", "--save_decoded_predictions", action="store_true", help="decodes the predictions and saves to a file")
-	parser.add_argument("-k", "--save_keywords_file", action="store_true", help="stores the key words at the B-tags and saves to a file")
 	parser.add_argument("-e", '--save_edge_case_file', action="store_true", help="saves edge cases for O insertions")
 	parser.add_argument("-w", '--save_weights_file', action="store_true", help="saves a weights file during training")
 
@@ -606,8 +734,6 @@ def main():
 		print("Stats file will be saved.")
 	if args.save_decoded_predictions:
 		print("Decoded predictions file will be saved.")
-	if args.save_keywords_file:
-		print("Keywords file will be saved.")	
 	if args.save_edge_case_file:
 		print("Edge case file will be saved.")
 	if args.save_weights_file:
@@ -616,11 +742,9 @@ def main():
 	os.environ['CUDA_VISIBLE_DEVICES'] = '6'
 
 	##### TRAINING AND TESTING PREREQS ######
-	# Parameters chosen based on previous cross-validation
-	params = {"num_epochs": 15, "lr": 3e-3, "num_layers": 1}
-
 	# Embedding type
-	embedding_type = "hf"
+	# embedding_type = "hf"
+	embedding_type = "gensim"
 
 	# Word2Vec/Fast-text/Glove Models
 	em_model_type = "other"
@@ -630,6 +754,26 @@ def main():
 	# em_model = "GoogleNews-vectors-negative300.bin"		  # Pre-trained w2v model
 	em_model = "fasttext-wiki-news-subwords-300"  		  # Pre-trained ft model
 	# em_model = "glove-wiki-gigaword-300"					  # Pre-trained glove model	
+
+
+	# Hyperparameters chosen based on previous cross-validation
+	params = {"num_epochs": 15, "lr": 3e-3, "num_layers": 1}
+
+	# Structure params
+	num_classes = 3
+	if embedding_type == "gensim":
+		input_size = 300
+	else:
+		input_size = 768
+	hidden_size = 100
+	bi_hidden_size = hidden_size*2
+	num_layers = 1
+
+	# Model instantiation
+	model = BiLSTM(input_size=input_size,
+				   hidden_size=bi_hidden_size,
+				   num_classes=num_classes,
+				   num_layers=params["num_layers"])
 
 	experiment_name = "../experiments/" + args.experiment_folder_name
 	experiment_details_file_name = "experiment_details.txt"
@@ -650,32 +794,6 @@ def main():
 		opened_file = open(os.path.join(experiment_name, error_file_name), "w")
 	if args.save_decoded_predictions:
 		opened_file_decode = open(os.path.join(experiment_name, decode_file_name), "w")
-
-
-	##### CROSS-VALIDATION #####
-	# if args.cv_or_train_or_test:
-	# 	cv_dict = json.loads()	
-	# 	batch_size = 1
-
-	# 	if args.save_stats_file:
-	# 		with open(os.path.join(experiment_name, stats_file_name), 'w') as csvfile:
-	# 			csv_writer = csv.writer(csvfile) 
-	# 			csv_writer.writerow(["Stats"])
-
-	# 	for i in range(len(cv_dict.keys()))
-	# 		train_dataset = TranscriptDataset(cv_dict=cv_dict, cv_value=i, cv_type="train")
-	# 		val_dataset = TranscriptDataset(cv_dict=cv_dict, cv_value=i, cv_type="test")
-	# 		train_loader = DataLoader(train_dataset,
-	# 		                          batch_size=batch_size,
-	# 		                          shuffle=False)
-	# 		val_loader = DataLoader(val_dataset,
-	# 		                        batch_size=batch_size,
-	# 		                        shuffle=False)
-
-	# 		if args.save_stats_file:
-	# 			train(params, train_loader, val_loader, val_indices, original_encodings, experiment_name, weights_file_name, stats_path=os.path.join(experiment_name, stats_file_name))
-
-
 
 	##### TRAINING ######
 	if args.train_or_test == "train":
@@ -709,9 +827,9 @@ def main():
 			with open(os.path.join(experiment_name, stats_file_name), 'w') as csvfile:
 				csv_writer = csv.writer(csvfile) 
 				csv_writer.writerow(["Stats"])
-			train(params, train_loader, val_loader, val_indices, original_encodings, experiment_name, weights_file_name, save_weights_file=args.save_weights_file, stats_path=os.path.join(experiment_name, stats_file_name))
+			train(params, model, train_loader, val_loader, val_indices, original_encodings, experiment_name, weights_file_name, save_weights_file=args.save_weights_file, stats_path=os.path.join(experiment_name, stats_file_name))
 		else:
-			train(params, train_loader, val_loader, val_indices, original_encodings, experiment_name, weights_file_name, save_weights_file=args.save_weights_file)
+			train(params, model, train_loader, val_loader, val_indices, original_encodings, experiment_name, weights_file_name, save_weights_file=args.save_weights_file)
 
 		opened_file_details.close()
 
@@ -726,9 +844,6 @@ def main():
 		final_output = []
 		counts_y = []
 		segment_list = []
-		key_words_x = []
-		key_words_y = []
-
 
 		files = [os.path.join(file_dir, filename) for filename in os.listdir(file_dir) if filename.endswith(".xlsx")]
 		file_names = [filename for filename in os.listdir(file_dir) if filename.endswith(".xlsx")]
@@ -745,7 +860,7 @@ def main():
 			                          shuffle=False)
 			original_encodings = test_dataset.encodings
 
-			test_x_encodings, test_y_encodings = test(params, test_loader, experiment_name, weights_file_name)
+			test_x_encodings, test_y_encodings = test(params, model, test_loader, experiment_name, weights_file_name)
 			test_arg_list = test_dataset.arguments	
 
 			remove_pad(test_x_encodings, test_y_encodings, original_encodings)
@@ -757,13 +872,14 @@ def main():
 			full_arg_list = full_arg_list + test_arg_list
 
 			if args.save_decoded_predictions:
-				final_output.append(decode_x(test_x_encodings, test_y_encodings, test_arg_list, segment_list, key_words_x, key_words_y, opened_file=opened_file_decode, write_to_file=True, file_name=file_names[x]))
+				decode_x(test_x_encodings, test_y_encodings, test_arg_list, segment_list, opened_file=opened_file_decode, write_to_file_decode=True, file_name=file_names[x], )
 
 		# Gold Segment Counts for X
 		bounded_counts_x, unbounded_counts_x = gold_counter_x(full_x_encodings)
 		greater_than_3 = [unbounded_counts_x[i] for i in range(len(unbounded_counts_x)) if counts_y[i] == 3 and unbounded_counts_x[i] >= 3]
 		print(collections.Counter(greater_than_3))
 		print(len(greater_than_3))
+
 
 		if args.save_stats_file:
 			##### TOKEN-LEVEL SAVING PRECISION AND RECALL TO CSV #####
@@ -810,10 +926,92 @@ def main():
 		opened_file.close()
 	if args.save_decoded_predictions:	
 		opened_file_decode.close()
+
+
+if __name__ == "__main__":
+	print("\n")
+	# parser = argparse.ArgumentParser(description="")
+	# parser.add_argument("-a", "--msg", type=str, help="description of task", required=True)
+	# args = parser.parse_args()
+	# print("Task: " + str(args.msg))
+
+	# Testing token modification
+	# file_dir = "../Data/DT_2019"
+	# files = [os.path.join(file_dir, filename) for filename in os.listdir(file_dir) if filename.endswith(".xlsx")]
+	# files = [files[0]]
+	# encodings_y_list = []
+	# tokens_x_list = []
+	# raw_arg_list = []
+	# tokens_modified_list = []
+	# for x in range(len(files)):
+	# 	out = convert_transcript(files[x])
+	# 	encodings_y, remove_list, _, segments = encode_y(to_TurnSegmentation(convert_transcript(files[x])))
+	# 	arg_list, tokens_x, _ = make_arg_list(to_TurnSegmentation(convert_transcript(files[x])))
+	# 	insert_Os(tokens_x, segments, encodings_y, files[x], None, out, write_to_file=False)
+	# 	encodings_y_list = encodings_y_list + encodings_y
+	# 	tokens_x_list = tokens_x_list + tokens_x
+	# 	tokens_modified = copy.deepcopy(tokens_x)
+	# 	tokens_modified_list += check_insertions(tokens_modified, encodings_y)
+	# 	raw_arg_list = raw_arg_list + arg_list 
+
+	# max_len = get_max_length(tokens_modified_list, encodings_y_list)
+	# create_embeddings_x_hf(raw_arg_list, max_len, tokens_modified_list, encodings_y_list)
+	# print("\n")
+
+
+	main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 	
 
 
 # COMMENT START
+
+	##### CROSS-VALIDATION #####
+	# if args.cv_or_train_or_test:
+	# 	cv_dict = json.loads()	
+	# 	batch_size = 1
+
+	# 	if args.save_stats_file:
+	# 		with open(os.path.join(experiment_name, stats_file_name), 'w') as csvfile:
+	# 			csv_writer = csv.writer(csvfile) 
+	# 			csv_writer.writerow(["Stats"])
+
+	# 	for i in range(len(cv_dict.keys()))
+	# 		train_dataset = TranscriptDataset(cv_dict=cv_dict, cv_value=i, cv_type="train")
+	# 		val_dataset = TranscriptDataset(cv_dict=cv_dict, cv_value=i, cv_type="test")
+	# 		train_loader = DataLoader(train_dataset,
+	# 		                          batch_size=batch_size,
+	# 		                          shuffle=False)
+	# 		val_loader = DataLoader(val_dataset,
+	# 		                        batch_size=batch_size,
+	# 		                        shuffle=False)
+
+	# 		if args.save_stats_file:
+	# 			train(params, train_loader, val_loader, val_indices, original_encodings, experiment_name, weights_file_name, stats_path=os.path.join(experiment_name, stats_file_name))
+
 
 	# # print(key_words_x)
 	# # print(key_words_y)
@@ -888,35 +1086,6 @@ def main():
 
 
 
-if __name__ == "__main__":
-	# parser = argparse.ArgumentParser(description="")
-	# parser.add_argument("-a", "--msg", type=str, help="description of task", required=True)
-	# args = parser.parse_args()
-	# print("Task: " + str(args.msg))
 
-	# Testing token modification
-	# file_dir = "../Data/DT_2019"
-	# files = [os.path.join(file_dir, filename) for filename in os.listdir(file_dir) if filename.endswith(".xlsx")]
-	# encodings_y_list = []
-	# tokens_x_list = []
-	# raw_arg_list = []
-	# tokens_modified_list = []
-	# for x in range(len(files)):
-	# 	out = convert_transcript(files[x])
-	# 	encodings_y, remove_list, _, segments = encode_y(to_TurnSegmentation(convert_transcript(files[x])))
-	# 	arg_list, tokens_x, _ = make_arg_list(to_TurnSegmentation(convert_transcript(files[x])))
-	# 	insert_Os(tokens_x, segments, encodings_y, files[x], None, out, write_to_file=False)
-	# 	encodings_y_list = encodings_y_list + encodings_y
-	# 	tokens_x_list = tokens_x_list + tokens_x
-	# 	tokens_modified = copy.deepcopy(tokens_x)
-	# 	tokens_modified_list += check_insertions(tokens_modified, encodings_y)
-	# 	raw_arg_list = raw_arg_list + arg_list 
-
-	# max_len = get_max_length(tokens_modified_list, encodings_y_list)
-	# create_embeddings_x_hf(raw_arg_list, max_len, tokens_modified_list, encodings_y_list)
-	# print("\n")
-
-
-	main()
 
 
